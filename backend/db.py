@@ -6,6 +6,7 @@ import psycopg
 from psycopg.rows import dict_row
 
 from build import clean_scan
+from daycut import compute_day, scan_time
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ods_scan (
@@ -41,6 +42,27 @@ CREATE TABLE IF NOT EXISTS build_rejects (
     source_id BIGINT NOT NULL REFERENCES ods_scan(id),
     reason TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS daycut_settings (
+    id SMALLINT PRIMARY KEY CHECK (id = 1),
+    rule TEXT NOT NULL,
+    cutoff_time TIME,
+    pinned_by TEXT NOT NULL,
+    pinned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    pinned_date DATE NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daycut_contention (
+    id BIGSERIAL PRIMARY KEY,
+    scan_id BIGINT NOT NULL REFERENCES ods_scan(id),
+    wanted_date DATE NOT NULL,
+    expected_date DATE NOT NULL,
+    attempted_by TEXT NOT NULL,
+    attempted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    note TEXT NOT NULL DEFAULT '日切争用'
+);
+
+ALTER TABLE build_runs ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'ok';
 """
 
 
@@ -84,6 +106,12 @@ def _seed(conn):
         {"scan": "IN", "box": "TCLU5566778", "at": "2026-11-12T09:15:00", "gate": "T2"},
         {"scan": "XX", "box": "TCLU5566778", "at": "2026-11-12T11:00:00", "gate": "T2"},
         {"scan": "RS", "box": "BAD", "at": "2026-11-12T12:00:00", "gate": "T2"},
+        # 跨日：时刻落在 11-13，闸口记在了 11-12
+        {"scan": "OUT", "box": "TCLU5566778", "at": "2026-11-13T00:18:00", "gate": "T2"},
+        # 过 23:00 日切线，规则是过线改记次日时要进跨日队列
+        {"scan": "IN", "box": "MSKU9081726", "at": "2026-11-12T23:40:00", "gate": "T1"},
+        # 时刻空着，不进跨日队列
+        {"scan": "RS", "box": "CSNU1029384", "at": "", "gate": "T1"},
     ]
     for payload in built:
         _land(conn, "2026-11-11", payload["gate"], payload)
@@ -140,3 +168,114 @@ def rebuild_day(conn, biz_date: str, username: str):
         (accepted, rejected, run["id"]),
     )
     return run["id"]
+
+
+def get_settings(conn):
+    return conn.execute(
+        "SELECT rule, cutoff_time, pinned_by, pinned_at, pinned_date FROM daycut_settings WHERE id = 1"
+    ).fetchone()
+
+
+def pin_settings(conn, rule, cutoff, username, today):
+    """钉死日切规则。咨询锁排队，写进设置后当天不许再改。"""
+    conn.execute("SELECT pg_advisory_xact_lock(821203)")
+    row = conn.execute("SELECT pinned_date FROM daycut_settings WHERE id = 1").fetchone()
+    if row and row["pinned_date"] == today:
+        return "规则写进日切设置后，当天不许再改"
+    conn.execute(
+        """
+        INSERT INTO daycut_settings (id, rule, cutoff_time, pinned_by, pinned_at, pinned_date)
+        VALUES (1, %s, %s, %s, NOW(), %s)
+        ON CONFLICT (id) DO UPDATE SET
+            rule = EXCLUDED.rule,
+            cutoff_time = EXCLUDED.cutoff_time,
+            pinned_by = EXCLUDED.pinned_by,
+            pinned_at = NOW(),
+            pinned_date = EXCLUDED.pinned_date
+        """,
+        (rule, cutoff, username, today),
+    )
+    return None
+
+
+def daycut_rows(conn, settings, biz_date=None):
+    """日切列表：每条扫描的落入日、改记日、记录日。时刻空着的不算改记日。"""
+    sql = "SELECT id, biz_date, terminal_code, raw_payload FROM ods_scan"
+    params = ()
+    if biz_date is not None:
+        sql += " WHERE biz_date = %s"
+        params = (biz_date,)
+    sql += " ORDER BY id"
+    items = []
+    for row in conn.execute(sql, params).fetchall():
+        payload = row["raw_payload"]
+        if isinstance(payload, str):
+            payload = json.loads(payload)
+        stamp, why = scan_time(payload)
+        cut = compute_day(settings, stamp) if settings and stamp else None
+        items.append(
+            {
+                "id": row["id"],
+                "terminal_code": row["terminal_code"],
+                "payload": payload,
+                "biz_date": row["biz_date"],
+                "stamp": stamp,
+                "stamp_note": why,
+                "natural_date": stamp.date() if stamp else None,
+                "cut_date": cut,
+                "cross": bool(cut and cut != row["biz_date"]),
+            }
+        )
+    return items
+
+
+def settle_scan(conn, scan_id, wanted, username):
+    """给跨日扫描定业务日。行锁排队，只放行与日切设置一致的那次。"""
+    settings = get_settings(conn)
+    if not settings:
+        return "日切尚未钉住，不许开始定业务日", 409
+    row = conn.execute(
+        "SELECT id, biz_date, raw_payload FROM ods_scan WHERE id = %s FOR UPDATE",
+        (scan_id,),
+    ).fetchone()
+    if not row:
+        return "这条扫描不存在", 404
+    payload = row["raw_payload"]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    stamp, why = scan_time(payload)
+    if not stamp:
+        return f"{why}，不进跨日队列", 400
+    expected = compute_day(settings, stamp)
+    if wanted != expected or row["biz_date"] == expected:
+        conn.execute(
+            """
+            INSERT INTO daycut_contention (scan_id, wanted_date, expected_date, attempted_by)
+            VALUES (%s, %s, %s, %s)
+            """,
+            (scan_id, wanted, expected, username),
+        )
+        return "日切争用", 409
+    conn.execute("UPDATE ods_scan SET biz_date = %s WHERE id = %s", (expected, scan_id))
+    return None, 200
+
+
+def record_rule_mismatch(conn, biz_date, username):
+    """构建携带的规则和日切设置不一致：整批记日切规则不符，不入明细。"""
+    rows = conn.execute(
+        "SELECT id FROM ods_scan WHERE biz_date = %s ORDER BY id",
+        (biz_date,),
+    ).fetchall()
+    run = conn.execute(
+        """
+        INSERT INTO build_runs (biz_date, accepted_count, rejected_count, built_by, status)
+        VALUES (%s, 0, %s, %s, 'rule_mismatch')
+        RETURNING id
+        """,
+        (biz_date, len(rows), username),
+    ).fetchone()
+    for row in rows:
+        conn.execute(
+            "INSERT INTO build_rejects (run_id, source_id, reason) VALUES (%s, %s, '日切规则不符')",
+            (run["id"], row["id"]),
+        )
